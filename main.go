@@ -1,22 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/XiaoMengXinX/Music163Api-Go/api"
-	"github.com/XiaoMengXinX/Music163Api-Go/types"
-	"github.com/XiaoMengXinX/Music163Api-Go/utils"
-	"github.com/robfig/cron/v3"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/XiaoMengXinX/Music163Api-Go/api"
+	"github.com/XiaoMengXinX/Music163Api-Go/types"
+	"github.com/XiaoMengXinX/Music163Api-Go/utils"
+	"github.com/robfig/cron/v3"
+	log "github.com/sirupsen/logrus"
 )
 
 // LogFormatter 自定义 log 格式
@@ -36,6 +40,8 @@ var eventLag RandomNum
 var msgLag RandomNum
 var mlogLag RandomNum
 var processingUser int
+var circleID string
+var pushMsg string
 var configFileName = flag.String("c", "config.json", "Config filename") // 从 cli 参数读取配置文件名
 var printVersion = flag.Bool("v", false, "Print version")
 var isDEBUG = flag.Bool("d", false, "DEBUG mode")
@@ -126,6 +132,7 @@ Build ARCH: %s
 
 	startTasks()
 	startCron()
+	startPushMsg()
 }
 
 func startCron() {
@@ -185,6 +192,52 @@ func startTasks() {
 	}
 }
 
+// 推送消息
+func startPushMsg() {
+	// PushPlus
+	if config.PushPlusToken != "" {
+		// 消息内容
+		content := fmt.Sprintf("网易云音乐自动任务已完成")
+		content += pushMsg
+		// 推送相关
+		data := url.Values{}
+		data.Set("token", config.PushPlusToken)
+		data.Set("title", "网易云音乐自动任务")
+		data.Set("content", content)
+		res, err := http.PostForm("http://www.pushplus.plus/send", data)
+		if err != nil {
+			log.Errorln(err)
+		}
+		defer res.Body.Close()
+		log.Println("PushPlus推送：", res.Status)
+	}
+	// Server酱
+	if config.ServerSendKey != "" {
+		sendUrl := fmt.Sprintf("https://sc.ftqq.com/%s.send", config.ServerSendKey)
+		// 消息内容
+		type Message struct {
+			Title string `json:"title"`
+			Desp  string `json:"desp"`
+		}
+		title := fmt.Sprintf("网易云音乐自动任务")
+		content := fmt.Sprintf("网易云音乐自动任务已完成")
+		content += pushMsg
+		content = strings.ReplaceAll(content, "\n", "\n\n")
+		message := Message{
+			Title: title,
+			Desp:  content,
+		}
+		messageJson, err := json.Marshal(message)
+		// 推送相关
+		res, err := http.Post(sendUrl, "application/json", bytes.NewReader(messageJson))
+		if err != nil {
+			log.Errorln(err)
+		}
+		defer res.Body.Close()
+		log.Println("Server酱推送：", res.Status)
+	}
+}
+
 func autoTasks(userData types.LoginStatusData, data utils.RequestData) error {
 	defer func() {
 		err := recover()
@@ -201,6 +254,8 @@ func autoTasks(userData types.LoginStatusData, data utils.RequestData) error {
 		return err
 	}
 	if strings.Contains(userDetail.CurrentExpert.RoleName, "网易音乐人") {
+		artistDetail, err := api.GetArtistHomepage(data, int64(userDetail.Profile.ArtistId))
+		parseCircleID(artistDetail)
 		autoTasks, err := checkCloudBean(userData, data)
 		if err != nil {
 			return err
@@ -227,15 +282,22 @@ func autoTasks(userData types.LoginStatusData, data utils.RequestData) error {
 	return nil
 }
 
-func musicianTasks(userData types.LoginStatusData, data utils.RequestData, autoTasks []int, i int) {
+func musicianTasks(userData types.LoginStatusData, data utils.RequestData, autoTasks []string, i int) {
 	defer func() {
 		err := recover()
 		if err != nil {
 			log.Errorln(err)
 		}
 	}()
-	switch autoTasks[i] {
-	case 399000:
+	switch {
+	case strings.Contains(autoTasks[i], "分享"):
+		log.Printf("[%s] 执行分享音乐任务中", userData.Profile.Nickname)
+		err := shareMusicTask(userData, data)
+		if err != nil {
+			log.Println(err)
+		}
+		log.Printf("[%s] 分享音乐任务执行完成", userData.Profile.Nickname)
+	case strings.Contains(autoTasks[i], "签到"):
 		log.Printf("[%s] 执行音乐人签到任务中", userData.Profile.Nickname)
 		result, err := api.MusicianSign(data)
 		if err != nil {
@@ -246,14 +308,14 @@ func musicianTasks(userData types.LoginStatusData, data utils.RequestData, autoT
 		} else {
 			log.Printf("[%s] 音乐人签到失败: %s", userData.Profile.Nickname, result.Message)
 		}
-	case 398000:
+	case strings.Contains(autoTasks[i], "动态"):
 		log.Printf("[%s] 执行发送动态任务中", userData.Profile.Nickname)
 		err := sendEventTask(userData, data)
 		if err != nil {
 			log.Println(err)
 		}
 		log.Printf("[%s] 发送动态任务执行完成", userData.Profile.Nickname)
-	case 393001:
+	case strings.Contains(autoTasks[i], "评论"):
 		log.Printf("[%s] 执行回复评论任务中", userData.Profile.Nickname)
 		commentConfig := api.CommentConfig{
 			ResType:      api.ResTypeMusic,
@@ -266,22 +328,22 @@ func musicianTasks(userData types.LoginStatusData, data utils.RequestData, autoT
 			log.Println(err)
 		}
 		log.Printf("[%s] 发送回复评论执行完成", userData.Profile.Nickname)
-	case 395002:
+	case strings.Contains(autoTasks[i], "私信"):
 		log.Printf("[%s] 执行发送私信任务中", userData.Profile.Nickname)
 		err := sendMsgTask(userData, config.SendMsgConfig.UserID[processingUser], data)
 		if err != nil {
 			log.Println(err)
 		}
 		log.Printf("[%s] 发送私信任务执行完成", userData.Profile.Nickname)
-	case 135000:
+	case strings.Contains(autoTasks[i], "mlog"):
 		log.Printf("[%s] 执行发送 Mlog 任务中", userData.Profile.Nickname)
 		err := sendMlogTask(userData, data)
 		if err != nil {
 			log.Println(err)
 		}
 		log.Printf("[%s] 发送 Mlog 任务执行完成", userData.Profile.Nickname)
-	case 396002:
-		log.Printf("[%s] 执行发主创说任务中", userData.Profile.Nickname)
+	case strings.Contains(autoTasks[i], "主创说"):
+		log.Printf("[%s] 执行发送主创说任务中", userData.Profile.Nickname)
 		commentConfig := api.CommentConfig{
 			ResType:      api.ResTypeMusic,
 			ResID:        config.CommentConfig.RepliedComment[processingUser].MusicID,
@@ -292,7 +354,65 @@ func musicianTasks(userData types.LoginStatusData, data utils.RequestData, autoT
 			log.Println(err)
 		}
 		log.Printf("[%s] 发送主创说任务执行完成", userData.Profile.Nickname)
+	case strings.Contains(autoTasks[i], "云圈"):
+		log.Printf("[%s] 执行访问云圈任务中", userData.Profile.Nickname)
+		err := getCircleTask(data)
+		if err != nil {
+			log.Println(err)
+		}
+		log.Printf("[%s] 访问云圈任务执行完成", userData.Profile.Nickname)
 	}
+}
+
+func shareMusicTask(userData types.LoginStatusData, data utils.RequestData) error {
+	shareResult, err := api.SongShare(data, config.MusicShareConfig.MySongID)
+	if err != nil {
+		return err
+	}
+	if shareResult.Code == 200 {
+		log.Printf("[%s] 分享音乐成功, 歌曲ID: %d", userData.Profile.Nickname, config.MusicShareConfig.MySongID)
+	} else {
+		log.Printf("[%s] 分享音乐失败, 原因: %s, 歌曲ID: %d", userData.Profile.Nickname, shareResult.Message, config.MusicShareConfig.MySongID)
+	}
+	sendResult, err := api.ShareResource(data, config.MusicShareConfig.MySongID, "song", "")
+	if err != nil {
+		return err
+	}
+	if sendResult.Code == 200 {
+		log.Printf("[%s] 发送歌曲分享动态成功, 动态ID: %d, 歌曲ID: %d", userData.Profile.Nickname, sendResult.Event.Id, config.MusicShareConfig.MySongID)
+		if config.EventSendConfig.LagConfig.LagBetweenSendAndDelete {
+			randomLag := eventLag.Get()
+			if randomLag != 0 {
+				log.Printf("[%s] 延时 %d 秒", userData.Profile.Nickname, randomLag)
+				time.Sleep(time.Duration(randomLag) * time.Second)
+			}
+		}
+		delResult, err := api.DelEvent(data, sendResult.Event.Id)
+		if err != nil {
+			return err
+		}
+		if delResult.Code != 200 {
+			log.Errorf("[%s] 删除动态失败, 动态ID: %d, 代码: %d, 原因: \"%s\"", userData.Profile.Nickname, sendResult.Event.Id, delResult.Code, delResult.Message)
+		} else {
+			log.Printf("[%s] 删除动态成功, 动态ID: %d", userData.Profile.Nickname, sendResult.Event.Id)
+		}
+	} else {
+		log.Errorf("[%s] 发送歌曲分享动态, 代码: %d, 原因: \"%s\"", userData.Profile.Nickname, sendResult.Code, sendResult.Message)
+	}
+	return nil
+}
+
+func getCircleTask(data utils.RequestData) error {
+	if circleID != "" {
+		result, err := api.GetCircle(data, circleID)
+		if err != nil {
+			return err
+		}
+		if result.Code != 200 {
+			return fmt.Errorf("%s", result.Message)
+		}
+	}
+	return nil
 }
 
 func userSignTask(userData types.LoginStatusData, data utils.RequestData) error {
@@ -304,6 +424,7 @@ func userSignTask(userData types.LoginStatusData, data utils.RequestData) error 
 		log.Printf("[%s] %s (%s)", userData.Profile.Nickname, result.Msg, "Android")
 	} else {
 		log.Printf("[%s] 签到成功 (%s)", userData.Profile.Nickname, "Android")
+		pushMsg += fmt.Sprintf("\n[%s] 签到成功 (%s)", userData.Profile.Nickname, "Android")
 	}
 
 	result, err = api.UserSign(data, 1)
@@ -314,13 +435,14 @@ func userSignTask(userData types.LoginStatusData, data utils.RequestData) error 
 		log.Printf("[%s] %s (%s)", userData.Profile.Nickname, result.Msg, "web/PC")
 	} else {
 		log.Printf("[%s] 签到成功 (%s)", userData.Profile.Nickname, "Android")
+		pushMsg += fmt.Sprintf("\n[%s] 签到成功 (%s)", userData.Profile.Nickname, "Android")
 	}
 	return nil
 }
 
 func sendEventTask(userData types.LoginStatusData, data utils.RequestData) error {
 	failedTimes := 0
-	for i := 0; i < 3; {
+	for i := 0; i < 1; {
 		if failedTimes >= 5 {
 			return fmt.Errorf("[%s] 发送动态累计 %d 次失败, 已自动退出", userData.Profile.Nickname, failedTimes)
 		}
@@ -364,7 +486,7 @@ func sendEventTask(userData types.LoginStatusData, data utils.RequestData) error
 func replyCommentTask(userData types.LoginStatusData, commentConfig api.CommentConfig, data utils.RequestData) error {
 	replyToID := commentConfig.CommentID
 	failedTimes := 0
-	for i := 0; i < 5; {
+	for i := 0; i < 2; {
 		if failedTimes >= 5 {
 			return fmt.Errorf("[%s] 回复评论累计 %d 次失败, 已自动退出", userData.Profile.Nickname, failedTimes)
 		}
@@ -412,7 +534,7 @@ func replyCommentTask(userData types.LoginStatusData, commentConfig api.CommentC
 
 func sendMsgTask(userData types.LoginStatusData, userIDs []int, data utils.RequestData) error {
 	failedTimes := 0
-	for i := 0; i < 5; {
+	for i := 0; i < 2; {
 		if failedTimes >= 5 {
 			return fmt.Errorf("[%s] 发送私信累计 %d 次失败, 已自动退出, 是不是工具人把你拉黑了(", userData.Profile.Nickname, failedTimes)
 		}
@@ -538,43 +660,71 @@ func vipGrowthpointTask(userData types.LoginStatusData, data utils.RequestData) 
 	return err
 }
 
-func checkCloudBean(userData types.LoginStatusData, data utils.RequestData) ([]int, error) {
+func checkCloudBean(userData types.LoginStatusData, data utils.RequestData) ([]string, error) {
 	cloudBeanData, err := api.GetCloudbeanNum(data)
 	if err != nil {
-		return []int{}, err
+		return nil, err
 	}
 	log.Printf("[%s] 账号当前云豆数: %d", userData.Profile.Nickname, cloudBeanData.Data.CloudBean)
+	pushMsg += fmt.Sprintf("\n[%s] 当前云豆数: %d", userData.Profile.Nickname, cloudBeanData.Data.CloudBean)
 	log.Printf("[%s] 获取音乐人任务中...", userData.Profile.Nickname)
-	tasksData, err := api.GetMusicianTasks(data)
+	dailyTasks, err := api.GetMusicianDailyTasks(data)
 	if err != nil {
-		return []int{}, err
+		return nil, err
+	}
+	weeklyTasks, err := api.GetMusicianWeeklyTasks(data)
+	if err != nil {
+		return nil, err
 	}
 	var isObtainCloudBean bool
-	var autoTasks []int
-	for i := 0; i < len(tasksData.Data.List); i++ {
-		if tasksData.Data.List[i].Status == 20 {
-			log.Printf("[%s] 「%s」任务已完成, 正在领取云豆", userData.Profile.Nickname, tasksData.Data.List[i].Description)
+	var autoTasks []string
+	for _, task := range dailyTasks.Data.List {
+		if task.Status == 20 {
+			log.Printf("[%s] 「%s」任务已完成, 正在领取云豆", userData.Profile.Nickname, task.Description)
 			isObtainCloudBean = true
-			result, err := api.ObtainCloudbean(data, tasksData.Data.List[i].UserMissionId, tasksData.Data.List[i].Period)
+			result, err := api.ObtainCloudbean(data, task.UserMissionId, task.Period)
 			if err != nil {
 				log.Errorln(err)
 			}
 			if result.Code == 200 {
-				log.Printf("[%s] 领取「%s」任务云豆成功", userData.Profile.Nickname, tasksData.Data.List[i].Description)
+				log.Printf("[%s] 领取「%s」任务云豆成功, 云豆+%s", userData.Profile.Nickname, task.Description, task.RewardWorth)
+				pushMsg += fmt.Sprintf("\n[%s] 完成「%s」任务云豆+%s", userData.Profile.Nickname, task.Description, task.RewardWorth)
 			} else {
-				log.Errorf("[%s] 领取「%s」任务云豆失败: %s", userData.Profile.Nickname, tasksData.Data.List[i].Description, result.Message)
+				log.Errorf("[%s] 领取「%s」任务云豆失败: %s", userData.Profile.Nickname, task.Description, result.Message)
 			}
+		} else if autoTaskAvail(task.Description) && task.Status != 100 {
+			log.Printf("[%s] 任务「%s」任务未完成或进行中", userData.Profile.Nickname, task.Description)
+			autoTasks = append(autoTasks, task.Description)
 		}
-		if autoTaskAvail(tasksData.Data.List[i].MissionId) && tasksData.Data.List[i].Status != 100 && tasksData.Data.List[i].Status != 20 {
-			log.Printf("[%s] 任务「%s」任务未完成或进行中", userData.Profile.Nickname, tasksData.Data.List[i].Description)
-			autoTasks = append(autoTasks, tasksData.Data.List[i].MissionId)
+	}
+	for _, task := range weeklyTasks.Data.List {
+		for _, s := range task.UserStageTargetList {
+			if s.Status == 20 {
+				log.Printf("[%s] 「%s」任务已完成, 正在领取云豆", userData.Profile.Nickname, task.Description)
+				isObtainCloudBean = true
+				if s.UserMissionId != 0 {
+					result, err := api.ObtainCloudbean(data, int(s.UserMissionId), task.Period)
+					if err != nil {
+						log.Errorln(err)
+					}
+					if result.Code == 200 {
+						log.Printf("[%s] 领取「%s」任务云豆成功, 云豆+%d", userData.Profile.Nickname, task.Description, s.Worth)
+						pushMsg += fmt.Sprintf("\n[%s] 完成「%s」任务云豆+%d", userData.Profile.Nickname, task.Description, s.Worth)
+					} else {
+						log.Errorf("[%s] 领取「%s」任务云豆失败: %s", userData.Profile.Nickname, task.Description, result.Message)
+					}
+				}
+			} else if autoTaskAvail(task.Description) && task.Status != 100 {
+				log.Printf("[%s] 任务「%s」任务未完成或进行中", userData.Profile.Nickname, task.Description)
+				autoTasks = append(autoTasks, task.Description)
+			}
 		}
 	}
 	if isObtainCloudBean {
 		time.Sleep(time.Duration(10) * time.Second)
 		cloudBeanData, err = api.GetCloudbeanNum(data)
 		if err != nil {
-			return []int{}, err
+			return nil, err
 		}
 		log.Printf("[%s] 账号当前云豆数: %d", userData.Profile.Nickname, cloudBeanData.Data.CloudBean)
 	}
@@ -605,12 +755,25 @@ func checkPathExists(path string) bool {
 	return false
 }
 
-func autoTaskAvail(val int) bool {
-	availAutoTasks := []int{135000, 399000, 398000, 393001, 395002, 396002}
-	for i := 0; i < len(availAutoTasks); i++ {
-		if val == availAutoTasks[i] {
-			return true
+func parseCircleID(artistDetail types.ArtistHomepageData) {
+	for _, d := range artistDetail.Data.Blocks {
+		if d.Code == "PERSONAL_MY_CIRCLE" {
+			for _, creative := range d.Creatives {
+				for _, r := range creative.Resources {
+					if r.ResourceType == "CIRCLE" && r.ResourceId != "" {
+						circleID = r.ResourceId
+						return
+					}
+
+				}
+			}
 		}
+	}
+}
+
+func autoTaskAvail(val string) bool {
+	if strings.Contains(val, "签到") || strings.Contains(val, "动态") || strings.Contains(val, "评论") || strings.Contains(val, "私信") || strings.Contains(val, "mlog") || strings.Contains(val, "主创说") || strings.Contains(val, "云圈") || strings.Contains(val, "分享") {
+		return true
 	}
 	return false
 }
